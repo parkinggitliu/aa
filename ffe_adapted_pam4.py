@@ -70,15 +70,15 @@ inv_mapping = {v: k for k, v in mapping.items()} # For checking errors later
 # Channel Model (Simple FIR Filter: [main_cursor, post_cursor1, post_cursor2, ...])
 # This channel introduces ISI from previous symbols
 #channel_taps = np.array([0.7, 0.2, 0.1]) # Main tap, 1st post-cursor, 2nd post-cursor
-channel_taps = np.array([1, 0.42, 0.26, 0.03])
+channel_taps = np.array([0.1, 0.2, 1])
 # Noise Level
 noise_stddev = 0.006  # Standard deviation of Additive White Gaussian Noise (AWGN)
 
-# DFE Parameters
-num_dfe_taps = 2      # Number of feedback taps (should match post-cursor ISI length)
-mu_dfe = 4e-5        # Step size (learning rate) for DFE tap adaptation (LMS)
+# FFE Parameters
+num_ffe_taps = 2      # Number of feedback taps (should match post-cursor ISI length)
+mu_ffe = 4e-5        # Step size (learning rate) for FFE tap adaptation (LMS)
 mu_delev = 8e-4     # Step size (learning rate) for delev adaptation (LMS)
-delev = 1           # Initial decision level (DLEV) for DFE
+delev = 1           # Initial decision level (DLEV) for FFE
 # --- 1. Generate PAM4 Signal ---
 # Generate random integers (0, 1)
 random_indices = np.random.randint(0, 4, N_symbols)
@@ -94,23 +94,23 @@ channel_output = np.convolve(tx_padded, channel_taps, mode='valid') # Keep only 
 
 # --- 3. Add Noise ---
 noise = np.random.normal(0, noise_stddev, channel_output.shape)
-agc_adj=0.35
-#agc_adj=1
+#agc_adj=0.51
+agc_adj=1
 received_signal = (channel_output + noise)*agc_adj
 #received_signal = channel_output 
 
-# --- 4. DFE Implementation ---
-dfe_taps = np.array([0.15, 0.05]) # Initialize DFE tap weights
-past_decisions = np.zeros(num_dfe_taps) # Buffer for past decided levels (DLEV)
-dfe_output_symbols = np.zeros(N_symbols)
+# --- 4. FFE Implementation ---
+ffe_taps = np.array([-0.05, -0.1]) # Initialize FFE tap weights
+past_rx_data = np.zeros(num_ffe_taps) # Buffer for past decided levels (DLEV)
+ffe_output_symbols = np.zeros(N_symbols)
 slicer_inputs = np.zeros(N_symbols) # Store slicer inputs for analysis/debug
-dfe_errors = np.zeros(N_symbols) # Store errors for analysis/debug
-dfe_tap1_history = np.zeros(N_symbols) # Store tap history for plotting
-dfe_tap2_history = np.zeros(N_symbols) # Store tap history for plotting
+ffe_errors = np.zeros(N_symbols) # Store errors for analysis/debug
+ffe_tap1_history = np.zeros(N_symbols) # Store tap history for plotting
+ffe_tap2_history = np.zeros(N_symbols) # Store tap history for plotting
 delev_history = np.zeros(N_symbols)  
 
-print(f"Starting DFE equalization with {num_dfe_taps} taps.")
-print(f"Initial DFE taps: {dfe_taps}")
+print(f"Starting FFE equalization with {num_ffe_taps} taps.")
+print(f"Initial FFE taps: {ffe_taps}")
 
 for k in range(N_symbols):
     # Get the current received sample corresponding to symbol k
@@ -121,14 +121,13 @@ for k in range(N_symbols):
 
     # Calculate ISI estimate from past decisions (DLEV)
     # isi_estimate = sum(dfe_taps[i] * past_decisions[i] for i in range(num_dfe_taps))
-    isi_estimate_x = np.dot(dfe_taps, past_decisions) # More efficient
-    isi_estimate2 = dfe_taps[1]*past_decisions[1] if k >= 2 else 0 # ISI from 2nd tap
-    isi_estimate1 = dfe_taps[0]*past_decisions[0] if k >= 1 else 0 # ISI from 1st tap
+    isi_estimate_x = np.dot(ffe_taps, past_rx_data) # More efficient
+    isi_estimate2 = ffe_taps[1]*past_rx_data[1] if k >= 2 else 0 # ISI from 2nd tap
+    isi_estimate1 = ffe_taps[0]*past_rx_data[0] if k >= 1 else 0 # ISI from 1st tap
     isi_estimate = isi_estimate1 + isi_estimate2 # ISI from main tap and 2 post-cursors
-    # Note: In a real DFE, the taps would be adapted based on the error signal.
-
+  
     # Subtract estimated ISI
-    slicer_input = current_rx_sample - isi_estimate
+    slicer_input = current_rx_sample + isi_estimate
     slicer_inputs[k] = slicer_input # Store for plotting/analysis
 
     # PAM4 Slicer (Decision Device)
@@ -138,7 +137,7 @@ for k in range(N_symbols):
     current_decision = pam4_levels[closest_level_index] # This is the decided DLEV
 
     # Store the decision
-    dfe_output_symbols[k] = current_decision
+    ffe_output_symbols[k] = current_decision
 
     # --- 5. LMS Adaptation (Optional) ---
     # Calculate error: difference between slicer input and the decided level
@@ -150,39 +149,37 @@ for k in range(N_symbols):
     else:
         print("Error: Current decision is not a valid PAM4 level.")
     error = np.sign(out_of_zone)
-    #error = current_decision - slicer_input # Common DFE error definition
-    dfe_errors[k] = error # Store for analysis/debug
-    gamma = 0.9
-    # Update DFE taps using LMS algorithm
+    #error = current_decision - slicer_input # Common error definition
+    ffe_errors[k] = error # Store for analysis/debug
+    # Update FFE taps using LMS algorithm
     # new_taps = old_taps + learning_rate * error * input_vector
-    # Input vector for DFE taps is the vector of past decisions (DLEV)
+    # Input vector for FFE taps is the vector of past decisions (DLEV)
     # dfe_taps = dfe_taps *(1-mu_dfe*gamma) + mu_dfe * error * past_decisions
-    dfe_adj =  mu_dfe * error * current_decision
+    ffe_adj =  mu_ffe * error * current_decision
     #dfe_adj =  mu_dfe * error * past_decisions
-    dfe_lkg = (1 - mu_dfe * gamma)*dfe_taps # Leakage term for DFE taps
-    dfe_taps = dfe_taps + dfe_adj # Update DFE taps
-    dfe_tap1_history[k] = dfe_taps[0] # Store for plotting/analysis
-    dfe_tap2_history[k] = dfe_taps[1] # Store for plotting/analysis 
+    ffe_taps = ffe_taps - ffe_adj # Update FFE taps
+    ffe_tap1_history[k] = ffe_taps[0] # Store for plotting/analysis
+    ffe_tap2_history[k] = ffe_taps[1] # Store for plotting/analysis 
     # --- Update Past Decisions Buffer ---
     # Shift buffer: oldest decision drops out, newest decision comes in
-    past_decisions = np.roll(past_decisions, 1)
-    past_decisions[0] = current_decision # Store the latest decided level (DLEV)
+    past_rx_data = np.roll(past_rx_data, -1)
+    past_rx_data[1] = received_signal[k] # Store the latest decided level (DLEV)
     delev_history[k]= delev 
     delev = delev - mu_delev* error 
     #delev = delev + mu_delev*np.sign(error)
     
-print(f"Final DFE taps after {N_symbols} symbols: {dfe_taps}")
+print(f"Final FFE taps after {N_symbols} symbols: {ffe_taps}")
 
 # --- 6. Performance Evaluation (Symbol Error Rate) ---
 # Compare DFE output with original transmitted symbols
 # Need to account for any delay introduced by the channel/equalizer setup.
 # Here, assuming simple alignment for demonstration.
-delay = 3 # Example delay (depends on channel and DFE setup)
-dfe_output_delayed = np.concatenate((np.zeros(delay), dfe_output_symbols[:-delay]))
-tx_symbols_delayed = np.concatenate((np.zeros(delay), tx_symbols[:-delay])) # Align tx symbols with DFE output
+delay = 2 # Example delay (depends on channel and FFE setup)
+ffe_output_delayed = np.concatenate((np.zeros(delay), ffe_output_symbols[:-delay]))
+tx_symbols_delayed = np.concatenate((np.zeros(delay), tx_symbols[:-delay])) # Align tx symbols with FFE output
 #errors = np.sum(tx_symbols[:N_symbols] != dfe_output_delayed[:N_symbols])
-errors =np.sum(abs(dfe_errors[20:N_symbols-20]) > 1) # Count errors based on DFE output
-ser_dfe = errors / N_symbols
+errors =np.sum(abs(ffe_errors[20:N_symbols-20]) > 1) # Count errors based on FFE output
+ser_ffe = errors / N_symbols
 
 # For comparison: SER without DFE (slicing the raw received signal)
 #no_dfe_decisions = np.zeros(N_symbols)
@@ -196,8 +193,8 @@ ser_dfe = errors / N_symbols
 
 print(f"\n--- Results ---")
 #print(f"Symbol Error Rate (SER) WITHOUT DFE: {ser_no_dfe:.4f} ({errors_no_dfe} errors)")
-print(f"Symbol Error Rate (SER) WITH DFE:    {ser_dfe:.4f} ({errors} errors)")
-print(f"Average Error is : {np.mean(dfe_errors[100:-100]):.4f}")
+print(f"Symbol Error Rate (SER) WITH FFE:    {ser_ffe:.4f} ({errors} errors)")
+print(f"Average Error is : {np.mean(ffe_errors[100:-100]):.4f}")
 print(f"Average tx symbol  is : {np.mean(tx_symbols[100:-100]):.4f}")
 print(f"Average received rx  is : {np.mean(received_signal[100:-100]):.4f}")
 
@@ -240,10 +237,11 @@ plt.grid(True)
 
 # Plot 3: DFE Output vs Time
 plt.subplot(2, 2, 3)
-plt.plot(time_axis, dfe_output_delayed[-100:], '.-', label='DFE Output Symbols', color='orange')
-#plt.plot(time_axis, tx_symbols_delayed[-100:], 'o-', label='Original Symbols Delayed', alpha=0.7)
-plt.plot(time_axis, tx_symbols[-100:], '*-', label='Original Symbols', color='green', alpha=0.5)
-plt.title('DFE Output (Last 100 Symbols)')
+#plt.plot(time_axis, ffe_output_symbols[-100:], '.-', label='FFE Output Symbols', color='orange')
+plt.plot(time_axis, ffe_output_delayed[-100:], '.-', label='FFE Output Symbols', color='orange')
+plt.plot(time_axis, tx_symbols_delayed[-100:], 'o-', label='Original Symbols Delayed', alpha=0.7)
+#plt.plot(time_axis, tx_symbols[-100:], '*-', label='Original Symbols', color='green', alpha=0.5)
+plt.title('FFE Output (Last 100 Symbols)')
 plt.xlabel('Symbol Index')
 plt.ylabel('Amplitude')
 plt.legend()
@@ -254,15 +252,14 @@ plt.grid(True)
 # Placeholder subplot
 plt.subplot(2, 2, 4)
 time_axis3 = np.arange(N_symbols) # Plot first 100 symbols
-plt.plot(time_axis3, dfe_tap1_history, '.-', label='DFE Tap1', color='orange')
-plt.plot(time_axis3, dfe_tap2_history, 'o-', label='DFE Tap2', color='blue',alpha=0.5)
-annotation_text = "Channel Taps: " + str(channel_taps) + "DFE Taps: " + str(dfe_taps) 
-plt.title(annotation_text)
+plt.plot(time_axis3, ffe_tap1_history, '.-', label='FFE Tap1', color='orange')
+plt.plot(time_axis3, ffe_tap2_history, 'o-', label='FFE Tap2', color='blue',alpha=0.5)
+annotation_text = "Channel Taps: " + str(channel_taps) + "FFE Taps: " + str(ffe_taps) 
+#plt.title(annotation_text)
+plt.title('FFE Tap Convergence')
 plt.xlabel('Symbol Index')
 plt.ylabel('Tap Value')
 plt.grid(True)
-plt.tight_layout()
-plt.show()
 '''
 bins=100
 hist, bin_edges = np.histogram(received_signal, bins=bins)
@@ -280,7 +277,7 @@ plt.grid(axis='y', alpha=0.75)
 
 
 bins=100
-hist, bin_edges = np.histogram(dfe_output_symbols, bins=bins)
+hist, bin_edges = np.histogram(ffe_output_symbols, bins=bins)
 plt.figure(figsize=(12, 8))
 plt.bar(bin_edges[:-1], hist, width=(bin_edges[1] - bin_edges[0]), align='edge')
 
@@ -292,24 +289,10 @@ plt.axvline(x=0, color='r', linestyle='--', label='Zero Level')
 plt.xlabel("Value")
 plt.ylabel("Frequency")
 plt.grid(axis='y', alpha=0.75)
-
-
 '''
+plt.tight_layout()
+plt.show()
 
-"""
-DFE_taps =2 
-FFE_taps =3
-FFE_pre = 1
-FFE_post = FFE_taps - FFE_pre - 1
-voltage_levels = np.array([-3, -1, 1, 3])
 
-signal_rx_cropped = received_signal 
-w_ffe_init = np.zeros(FFE_taps)
-w_dfe_init = np.zeros(DFE_taps)
-
-voltage_levels = np.array([-3, -1, 1, 3])
-w_ffe, w_dfe, v_combined_ffe, v_combined_dfe, z_combined, e_combined = sdp.lms_equalizer(signal_rx_cropped, 0.001, len(signal_rx_cropped), w_ffe_init, FFE_pre, w_dfe_init,  voltage_levels)
-print("FFE Weights: ", w_ffe)   
-print("DFE Weights: ", w_dfe)   
-"""  
+  
 
