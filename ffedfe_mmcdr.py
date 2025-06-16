@@ -327,6 +327,7 @@ class PAM4_Receiver_Equalizer:
             
             # Advance to next symbol
             sample_index += self.sps
+            print(f"Processed symbol {self.symbol_count}, Sample index: {sample_index}")
         
         return {
             'recovered_symbols': np.array(recovered_symbols),
